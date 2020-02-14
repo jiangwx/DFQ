@@ -1,7 +1,18 @@
 import torch
-from modeling.detection.skynet import *
+
+
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
+
+from utils.relation import create_relation
+from dfq import cross_layer_equalization, bias_absorption, bias_correction, clip_weight
+from utils.layer_transform import switch_layers, replace_op, restore_op, set_quant_minmax, merge_batchnorm, quantize_targ_layer
+from PyTransformer.transformers.torchTransformer import TorchTransformer
+from utils.quantize import QuantConv2d, QuantLinear, QuantNConv2d, QuantNLinear, QuantMeasure, QConv2d, QLinear, set_layer_bits
+from ZeroQ.distill_data import getDistilData
+from improve_dfq import update_scale, transform_quant_layer, set_scale, update_quant_range, set_update_stat, bias_correction_distill
+from modeling.detection.skynet import *
+
 from PIL import Image
 import argparse
 import pathlib
@@ -66,12 +77,81 @@ if __name__ == '__main__':
     assert args.relu or args.relu == args.equalize, 'must replace relu6 to relu while equalization'
     assert args.equalize or args.absorption == args.equalize, 'must use absorption with equalize'
 
-    model = SkyNet()
-    model.load_state_dict(torch.load('./modeling/detection/SkyNet.pth'))
-    model = model.to(DEVICE)
+    net = SkyNet()
+    net.load_state_dict(torch.load('./modeling/detection/SkyNet.pth'))
+    #net = net.to(DEVICE)
 
-    init_width = model.width
-    init_height = model.height
+    transformer = TorchTransformer()
+    module_dict = {}
+    if args.quantize:
+        if args.distill_range:
+            module_dict[1] = [(torch.nn.Conv2d, QConv2d), (torch.nn.Linear, QLinear)]
+        elif args.trainable:
+            module_dict[1] = [(torch.nn.Conv2d, QuantConv2d), (torch.nn.Linear, QuantLinear)]
+        else:
+            module_dict[1] = [(torch.nn.Conv2d, QuantNConv2d), (torch.nn.Linear, QuantNLinear)]
+    
+    if args.relu:
+        module_dict[0] = [(torch.nn.ReLU6, torch.nn.ReLU)]
+    
+    data = torch.ones((4, 3, 160, 320))
+    net, transformer = switch_layers(net, transformer, data, module_dict, ignore_layer=[QuantMeasure], quant_op=args.quantize)
+    graph = transformer.log.getGraph()
+    bottoms = transformer.log.getBottoms()
+    output_shape = transformer.log.getOutShapes()
+    if args.quantize:
+        if args.distill_range:
+            targ_layer = [QConv2d, QLinear]
+        elif args.trainable:
+            targ_layer = [QuantConv2d, QuantLinear]
+        else:
+            targ_layer = [QuantNConv2d, QuantNLinear]
+    else:
+        targ_layer = [torch.nn.Conv2d, torch.nn.Linear]
+
+    if args.quantize:
+        set_layer_bits(graph, args.bits_weight, args.bits_activation, args.bits_bias, targ_layer)
+
+    net = merge_batchnorm(net, graph, bottoms, targ_layer)
+
+    #create relations
+    if args.equalize or args.distill_range:
+        res = create_relation(graph, bottoms, targ_layer, delete_single=not args.distill_range)
+        if args.equalize:
+            cross_layer_equalization(graph, res, targ_layer, visualize_state=False, converge_thres=2e-7, s_range=(1/args.equal_range, args.equal_range))
+
+        # if args.distill:
+        #     set_scale(res, graph, bottoms, targ_layer)
+
+    if args.absorption:
+        bias_absorption(graph, res, bottoms, 3)
+    
+    if args.clip_weight:
+        clip_weight(graph, range_clip=[-15, 15], targ_type=targ_layer)
+
+    if args.correction:
+        bias_correction(graph, bottoms, targ_layer)
+
+    if args.quantize:
+        if not args.trainable and not args.distill_range:
+            graph = quantize_targ_layer(graph, args.bits_weight, args.bits_bias, targ_layer)
+
+        if args.distill_range:
+            set_update_stat(net, [QuantMeasure], True)
+            net = update_quant_range(net.cuda(), data_distill, graph, bottoms, is_detection=True)
+            set_update_stat(net, [QuantMeasure], False)
+        else:
+            set_quant_minmax(graph, bottoms, is_detection=True)
+
+        torch.cuda.empty_cache()
+    
+    net = net.to(DEVICE)
+    if args.quantize:
+        replace_op()
+    print("Start Inference")
+
+    init_width = net.width
+    init_height = net.height
     dataset = DACDataset(imgDir, shape=(init_width, init_height),
                          transform=transforms.Compose([
                                  transforms.ToTensor(),
@@ -83,12 +163,10 @@ if __name__ == '__main__':
         shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
-    # model = model.cuda()
-    model.eval()
-    print("Start Inference")
-
-    anchors = model.anchors
-    num_anchors = model.num_anchors
+    net = net.cuda()
+    net.eval()
+    anchors = net.anchors
+    num_anchors = net.num_anchors
     anchor_step = len(anchors) // num_anchors
     h = 20
     w = 40
@@ -108,7 +186,7 @@ if __name__ == '__main__':
     stime = time.time()
     for batch_idx, data in enumerate(test_loader):
         data = data.cuda()
-        output = model(data).data
+        output = net(data).data
         batch = output.size(0)
         output = output.view(batch * num_anchors, 5, h * w).transpose(0, 1).contiguous().view(5, batch * num_anchors * h * w)
 

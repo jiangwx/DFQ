@@ -70,7 +70,7 @@ class SkyNet(nn.Module):
         )
         self.model_p3 = nn.Sequential(  #cat dw3(ch:192 -> 768) and dw5(ch:512)
             conv_dw(1280, 96, 1),
-            nn.Conv2d(96, 10, 1, 1,bias=False),
+            nn.Conv2d(96, 10, 1, 1, bias=False),
         )
         self.loss = RegionLoss([1.4940052559648322, 2.3598481287086823,4.0113013115312155,5.760873975661669],2)
         self.anchors = self.loss.anchors
