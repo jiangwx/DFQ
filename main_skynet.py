@@ -79,7 +79,6 @@ if __name__ == '__main__':
 
     net = SkyNet()
     net.load_state_dict(torch.load('./modeling/detection/SkyNet.pth'))
-    #net = net.to(DEVICE)
 
     transformer = TorchTransformer()
     module_dict = {}
